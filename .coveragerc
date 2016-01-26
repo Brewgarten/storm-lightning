@@ -1,0 +1,17 @@
+# .coveragerc to control coverage.py
+[run]
+branch = True
+concurrency = multiprocessing
+omit =
+    */__init__.py
+    */_version.py
+    storm/lightning/lib/*
+parallel = True
+source =
+    storm
+
+[html]
+directory = test_results/coverage
+
+[xml]
+output = test_results/coverage.xml
