@@ -1,15 +1,19 @@
-import fnmatch
+"""
+`libcloud` driver based on `libvirt`
+"""
 import logging
-import re
+import os
 import socket
-import time
 
 from libcloud.common.types import LibcloudError
 from libcloud.compute.base import NodeDriver, Node, NodeImage, NodeSize, StorageVolume, NodeLocation
 from libcloud.compute.base import NodeState
 from libcloud.compute.providers import set_driver
 
-import storm.lightning.manager
+from storm.lightning import (DEFAULT_STORAGE_PATH,
+                             CloudImagesManager,
+                             LibVirtManager,
+                             waitForSSHAvailable)
 
 
 log = logging.getLogger(__name__)
@@ -27,11 +31,76 @@ class LocalNodeDriver(NodeDriver):
     """
     type = "local"
     name = "LocalNodeDriver"
-    features = {"create_node": ["generates_password", "password", "ssh_key"]}
+    features = {"create_node": ["generates_password"]}
 
     def __init__(self):
         super(LocalNodeDriver, self).__init__("local")
-        self.manager = storm.lightning.manager.LibVirtManager()
+        self.manager = LibVirtManager()
+        self.cloudImagesManager = CloudImagesManager()
+
+    def _domain_info_to_node(self, domainInfo):
+        """
+        Convert domain info into a libcloud Node
+
+        :param domainInfo: guest info
+        :type domainInfo: :class:`~DomainInfo`
+        :returns: node
+        :rtype: :class:`~libcloud.compute.base.Node`
+        """
+        state = NodeState.STOPPED
+
+        publicIps = []
+        networkInfos = self.manager.getNetworkInfosByDomain(domainInfo.name)
+        if networkInfos:
+            staticHost = self.manager.getStaticHostInfoByName(networkInfos[0].name, domainInfo.name)
+            if staticHost:
+                publicIps.append(staticHost.ip)
+
+                sshSocket = socket.socket()
+                sshSocket.settimeout(0.1)
+                try:
+                    sshSocket.connect((str(staticHost.ip), 22))
+                    sshSocket.recv(256)
+                    sshSocket.close()
+                    state = NodeState.RUNNING
+                except socket.error:
+                    pass
+
+        # TODO: size, images, and extra information
+        disks = {}
+        for diskInfo in domainInfo.diskInfos:
+            storageVolume = self.manager.getStorageVolumeInfoByPath(diskInfo.path)
+            if storageVolume:
+                disks[diskInfo.dev] = storageVolume.capacity / (1024 ** 3)
+
+        extra = {
+            "password": "password",
+            "disks" : disks
+        }
+        return Node(domainInfo.uuid,
+                    domainInfo.name,
+                    state,
+                    publicIps,
+                    [],
+                    self,
+                    extra=extra)
+
+    def _storage_volume_info_to_storage_volume(self, storageVolumeInfo):
+        """
+        Convert storage volume info into a libcloud StorageVolume
+
+        :param storageVolumeInfo: storage volume info
+        :type storageVolumeInfo: :class:`~StorageVolumeInfo`
+        :returns: storage volume
+        :rtype: :class:`~libcloud.compute.base.StorageVolume`
+        """
+        return StorageVolume("{poolName}/{name}".format(
+            poolName=storageVolumeInfo.poolName,
+            name=storageVolumeInfo.name),
+                             storageVolumeInfo.name,
+                             storageVolumeInfo.capacity/(1024*1024*1024),
+                             self,
+                             extra={"capacity" : storageVolumeInfo.capacity})
 
     def attach_volume(self, node, volume, device=None):
         """
@@ -54,10 +123,8 @@ class LocalNodeDriver(NodeDriver):
         Create a new node instance. This instance will be started
         automatically.
 
-        :param auth: initial authentication the node
-        :type auth: :class:`~libcloud.compute.base.NodeAuthSSHKey` or :class:`~libcloud.compute.base.NodeAuthPassword`
         :param image: image/template to be used for the node
-        :type image: :class:`~libcloud.compute.base.NodeSize`
+        :type image: :class:`~libcloud.compute.base.NodeImage`
         :param location: location
         :type location: :class:`~libcloud.compute.base.NodeLocation`
         :param name: node name
@@ -66,50 +133,47 @@ class LocalNodeDriver(NodeDriver):
         :type size: :class:`~libcloud.compute.base.NodeSize`
         :param subnetPrefix: subnet prefix, e.g., ``10.76``
         :type subnetPrefix: str
-        :param replace: replace component with same name
-        :type replace: bool
         :returns: :class:`~libcloud.compute.base.Node`
         """
         if "name" not in kwargs:
             raise ValueError("name needs to be specified")
         name = kwargs["name"]
-        # TODO: implement resizing templates
-#         if "size" not in kwargs:
-#             raise ValueError("size needs to be specified")
         if "image" not in kwargs:
             raise ValueError("image needs to be specified")
         image = kwargs["image"]
+        log.debug("retrieving image '%s' version '%s'", image.extra["imageType"], image.extra["version"])
+        imagePath = self.cloudImagesManager.getImage(image.extra["imageType"], image.extra["version"])
+        log.debug("finished retrieving image '%s' version '%s'", image.extra["imageType"], image.extra["version"])
 
-        if "subnetPrefix" not in kwargs:
-            raise ValueError("subnetPrefix needs to be specified")
-        subnetPrefix = kwargs["subnetPrefix"]
-
+        if "size" not in kwargs:
+            raise ValueError("size needs to be specified")
+        size = kwargs["size"]
         if "location" in kwargs:
             log.warn("This driver currently does not support different locations")
-        if "size" in kwargs:
-            log.warn("This driver currently does not support different locations")
+
+        subnetPrefix = kwargs.get("subnetPrefix", self.manager.getAvailableSubnetPrefixes()[0])
 
         log.debug("creating '%s' using '%s' in subnet '%s'", name, image.name, subnetPrefix)
 
-        if "auth" in kwargs:
-            log.debug("using authentication")
-        replace = False
-        if "replace" in kwargs:
-            replace = kwargs["replace"]
-
         networkName = "net{0}".format(subnetPrefix)
         poolName = "pool{0}".format(subnetPrefix)
+        disks = size.extra.get("disks", [size.disk])
 
-        self.manager.createNetwork(networkName, subnetPrefix=subnetPrefix, replace=replace)
-        self.manager.createStoragePool(poolName, [], [], replace=replace)
-        self.manager.createGuestUsingTemplate(name, poolName, networkName, image.name)
-
-        # TODO: allow adding disks here or only in separate attach_volume method?
+        if self.manager.getNetworkInfoByName(networkName) is None:
+            self.manager.createNetwork(networkName, subnetPrefix)
+        if self.manager.getStoragePoolInfoByName(poolName) is None:
+            self.manager.createStoragePool(poolName)
+        self.manager.createStorageVolumes(poolName, name, disks)
 
         # start node automatically unless specified otherwise
-        if kwargs.get("start", True):
-            self.ex_start_node(name)
-        return self._guest_info_to_node(self.manager.getGuestInfoByName(name))
+        self.manager.createDomain(name,
+                                  imagePath,
+                                  poolName,
+                                  networkName,
+                                  memory=size.ram,
+                                  cpus=size.extra.get("cpus", 2))
+
+        return self._domain_info_to_node(self.manager.getDomainInfoByName(name))
 
     def create_volume(self, size, name, location=None, snapshot=None):
         """
@@ -145,8 +209,10 @@ class LocalNodeDriver(NodeDriver):
         :type node: :class:`~libcloud.compute.base.Node`
         :returns: ``True`` if the destroy was successful, ``False`` otherwise.
         """
-        self.manager.deleteGuest(node.name)
-        return True
+        if node:
+            self.manager.deleteDomain(node.name)
+            return True
+        return False
 
     def destroy_volume(self, volume):
         """
@@ -164,70 +230,6 @@ class LocalNodeDriver(NodeDriver):
             return False
         self.manager.deleteStorageVolume(names[-2], names[-1])
         return True
-
-    def _guest_info_to_node(self, guestInfo):
-        """
-        Convert guest info into a libcloud Node
-
-        :param guestInfo: guest info
-        :type guestInfo: :class:`~virtinst.Guest`
-        :returns: node
-        :rtype: :class:`~libcloud.compute.base.Node`
-        """
-        state = NodeState.STOPPED
-
-        publicIps = []
-        networks = self.manager.getNetworkInfosByGuest(guestInfo.name)
-        if networks:
-            staticHost = self.manager.getStaticHostByName(networks[0].name, guestInfo.name)
-            if staticHost:
-                publicIps.append(staticHost.ip)
-
-                sshSocket = socket.socket()
-                sshSocket.settimeout(0.1)
-                try:
-                    sshSocket.connect((str(staticHost.ip), 22))
-                    sshSocket.recv(256)
-                    sshSocket.close()
-                    state = NodeState.RUNNING
-                except:
-                    pass
-
-        # TODO: size, images, and extra information
-        disks = []
-        for device in guestInfo.get_all_devices():
-            if hasattr(device, "is_disk") and device.is_disk():
-                storageVolume = self.manager.getStorageVolumeInfoByPath(device.path)
-                if storageVolume:
-                    disks.append(storageVolume.capacity / (1024 ** 3))
-
-        extra={"password": "password",
-               "disks" : { 'num': len(disks), 'details':disks } }
-        return Node(guestInfo.uuid,
-                    guestInfo.name,
-                    state,
-                    publicIps,
-                    [],
-                    self,
-                    extra=extra)
-
-    def ex_create_image_from_iso(self, name, iso, ks, cpus=2, memory=2048, capacity=None, replace=None):
-        """
-        Create a node from an iso and kickstart file
-
-        :param name: name of the node
-        :type name: str
-        :param iso: path to iso
-        :type iso: str
-        :param ks: path to kickstart file
-        :type ks: str
-        :param capacity: capacity of OS disk
-        :type capacity: int
-
-        :returns: :class:`~libcloud.compute.base.NodeImage`
-        """
-        self.manager.createTemplate(name, iso, ks, cpus=cpus, memory=memory, capacity=capacity, replace=replace)
-        return self.ex_get_image_by_name(name)
 
     def ex_destroy_network(self, netName):
         """
@@ -255,11 +257,9 @@ class LocalNodeDriver(NodeDriver):
         :type name: str
         :returns: :class:`~libcloud.compute.base.NodeImage`
         """
-        guestInfo = self.manager.getGuestInfoByName(name)
-        if guestInfo:
-            return NodeImage(guestInfo.uuid,
-                        guestInfo.name,
-                        self)
+        for image in self.list_images():
+            if image.name == name:
+                return image
         return None
 
     def ex_get_node_by_name(self, name):
@@ -270,9 +270,9 @@ class LocalNodeDriver(NodeDriver):
         :type name: str
         :returns: :class:`~libcloud.compute.base.Node`
         """
-        guestInfo = self.manager.getGuestInfoByName(name)
-        if guestInfo:
-            return self._guest_info_to_node(guestInfo)
+        domainInfo = self.manager.getDomainInfoByName(name)
+        if domainInfo:
+            return self._domain_info_to_node(domainInfo)
         return None
 
     def ex_get_volume_by_name(self, name):
@@ -283,14 +283,11 @@ class LocalNodeDriver(NodeDriver):
         :type name: str
         :returns: :class:`~libcloud.compute.base.StorageVolume`
         """
-        storageVolume = self.manager.getStorageVolumeInfoByPath("/tmp/{0}".format(name))
-        if storageVolume:
-            sizeInGB = storageVolume.capacity/(1024*1024*1024)
-            return StorageVolume(storageVolume.key,
-                                storageVolume.name,
-                                sizeInGB,
-                                self,
-                                extra={"capacity" : storageVolume.capacity})
+        storageVolumeInfo = self.manager.getStorageVolumeInfoByPath(
+            os.path.join(DEFAULT_STORAGE_PATH, name)
+        )
+        if storageVolumeInfo:
+            return self._storage_volume_info_to_storage_volume(storageVolumeInfo)
         return None
 
     def ex_start_node(self, node, wait=True):
@@ -302,8 +299,7 @@ class LocalNodeDriver(NodeDriver):
         :param wait: wait for the node to finish starting
         :type wait: bool
         """
-        guest = self.manager.getGuestByName(node.name)
-        guest.create()
+        self.manager.startDomain(node.name)
         if wait:
             self.ex_wait_for_ready(node)
 
@@ -317,55 +313,33 @@ class LocalNodeDriver(NodeDriver):
         :type timeout: int
         """
         if node:
-            sshSocket = socket.socket()
-            sshSocket.settimeout(1)
-            start = time.time()
-            end = start + timeout
-            while time.time() < end:
-
-                try:
-                    sshSocket.connect((str(node.public_ips[0]), 22))
-                    sshSocket.recv(256)
-                    sshSocket.close()
-                    break
-                except:
-                    time.sleep(1)
-
-            if time.time() > end:
+            available = waitForSSHAvailable(node.public_ips[0], timeout=timeout)
+            if not available:
                 raise LibcloudError(
-                        value="Could not start node {0}, timed out after {1} seconds".format(node.name, timeout),
-                        driver=self)
+                    value="Could not start node {0}, timed out after {1} seconds".format(node.name, timeout),
+                    driver=self)
 
-    def list_images(self, location=None, listPublic=False, details=False):
+    def list_images(self, location=None):
         """
         Get a list of images
 
         :param location: location (ignored by driver)
-        :param bool listPublic: (ignored by driver)
         :returns: [:class:`~libcloud.compute.base.NodeImage`]
         """
         images = []
         imageId = 1
-        guests = sorted(self.manager.getGuestInfos(), key=lambda guest: guest.name)
-        for guest in guests:
-            networks = self.manager.getNetworkInfosByGuest(guest.name)
-            # for now only check first network
-            if networks[0].name == "templates":
-                # TODO: extra information
-                disks = []
-                if details:
-                    for device in guest.get_all_devices():
-                        if hasattr(device, "is_disk") and device.is_disk():
-                            storageVolume = self.manager.getStorageVolumeInfoByPath(device.path)
-                            if storageVolume:
-                                disks.append(storageVolume.capacity / (1024 ** 3))
-
-                extra={"guid": guest.uuid,
-                       "disks" : { 'num': len(disks), 'details':disks } }
-                images.append(NodeImage(imageId,
-                                  guest.name,
-                                  self,
-                                  extra=extra))
+        for imageType in sorted(self.cloudImagesManager.getTypes()):
+            for version in sorted(self.cloudImagesManager.getVersions(imageType)):
+                extra = {
+                    "imageType": imageType,
+                    "version": version
+                }
+                images.append(
+                    NodeImage(imageId,
+                              "{imageType}-{version}".format(imageType=imageType, version=version),
+                              self,
+                              extra=extra)
+                )
                 imageId += 1
         return images
 
@@ -384,32 +358,12 @@ class LocalNodeDriver(NodeDriver):
 
         :returns: [:class:`~libcloud.compute.base.Node`]
         """
-        nodes = []
-        for guestInfo in self.manager.getGuestInfos():
-            networks = self.manager.getNetworkInfosByGuest(guestInfo.name)
-            # for now only check first network and for specific naming convention
-            if re.match("^net\d{1,3}\.\d{1,3}", networks[0].name):
-                nodes.append(self._guest_info_to_node(guestInfo))
+        nodes = [
+            self._domain_info_to_node(domainInfo)
+            for domainInfo in self.manager.getDomainInfos()
+        ]
         nodes = sorted(nodes, key=lambda node: node.name)
         return nodes
-
-    def ex_list_nodes(self, hostname=None, domain=None):
-        """
-        Get a list of nodes, optionally filtered by hostname
-
-        ..note::
-            The domain filtering is not supported for local
-
-        :param hostname: A hostname or pattern to filter list of nodes
-        :type hostname: str
-        :param domain: Unused
-        :type domain: str
-        :returns: [:class:`~libcloud.compute.base.Node`]
-        """
-        return [
-            node for node in self.list_nodes()
-            if hostname is None or fnmatch.fnmatch(node.name, hostname)
-        ]
 
     def list_sizes(self, location=None):
         """
@@ -420,8 +374,8 @@ class LocalNodeDriver(NodeDriver):
         """
         sizes = []
         # TODO: define more sizes
-        sizes.append(NodeSize(1, "1 CPU, 1GB ram, 10GB", 1024, 10, 1000, 0.0, self, {"cpus": 1}))
-        sizes.append(NodeSize(2, "2 CPU, 2GB ram, 10GB", 2048, 10, 1000, 0.0, self, {"cpus": 2}))
+        sizes.append(NodeSize(1, "1 CPU, 1GB ram, 10GB", 1024, 10, 1000, 0.0, self, extra={"cpus": 1}))
+        sizes.append(NodeSize(2, "2 CPU, 2GB ram, 10GB", 2048, 10, 1000, 0.0, self, extra={"cpus": 2}))
         return sizes
 
     def list_volumes(self):
@@ -431,15 +385,10 @@ class LocalNodeDriver(NodeDriver):
         :returns: [:class:`~libcloud.compute.base.StorageVolume`]
         """
         volumes = []
-        for storageVolume in self.manager.getStorageVolumeInfos():
-            # limit volumes to qcow2 for now
-            if storageVolume.format == "qcow2":
-                sizeInGB = storageVolume.capacity/(1024*1024*1024)
-                volumes.append(StorageVolume(storageVolume.key,
-                                             storageVolume.name,
-                                             sizeInGB,
-                                             self,
-                                             extra={"capacity" : storageVolume.capacity}))
+        for storageVolumeInfo in self.manager.getStorageVolumeInfos():
+            # limit to user generated volumes of type qcow2
+            if storageVolumeInfo.path.startswith(DEFAULT_STORAGE_PATH) and storageVolumeInfo.format == "qcow2":
+                volumes.append(self._storage_volume_info_to_storage_volume(storageVolumeInfo))
         return volumes
 
 set_driver(LocalNodeDriver.type, LocalNodeDriver.__module__, LocalNodeDriver.name)

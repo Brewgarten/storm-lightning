@@ -1,6 +1,8 @@
 Welcome to Storm Lightning's documentation!
 ===========================================
 
+To use, simply add ``import storm.driver.local`` to your project
+
 Contents:
 
 .. toctree::

@@ -1,0 +1,17 @@
+{
+    "CentOS": {
+        "latest": "7.2-1511",
+        "versions": {
+            "7.2-1511": "http://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud-1511.qcow2",
+            "7.1-1503": "http://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud-1503.qcow2"
+        }
+    },
+    "Fedora": {
+        "latest": "23",
+        "versions": {
+            "23": "https://www.mirrorservice.org/sites/dl.fedoraproject.org/pub/fedora/linux/releases/23/Cloud/x86_64/Images/Fedora-Cloud-Base-23-20151030.x86_64.qcow2",
+            "22": "https://www.mirrorservice.org/sites/dl.fedoraproject.org/pub/fedora/linux/releases/22/Cloud/x86_64/Images/Fedora-Cloud-Base-22-20150521.x86_64.qcow2",
+            "21": "https://www.mirrorservice.org/sites/dl.fedoraproject.org/pub/fedora/linux/releases/21/Cloud/Images/x86_64/Fedora-Cloud-Base-20141203-21.x86_64.qcow2"
+        }
+    }
+}

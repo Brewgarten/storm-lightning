@@ -10,12 +10,6 @@ import versioneer
 needs_pytest = {"pytest", "test", "ptr", "coverage"}.intersection(sys.argv)
 pytest_runner = ["pytest-runner"] if needs_pytest else []
 
-try:
-    import guestfs
-except ImportError:
-    print("Required Python module 'guestfs' is missing, please install using something like 'sudo yum install python-libguestfs'", file=sys.stderr)
-    sys.exit(1)
-
 setup(
     author = "IBM",
     author_email = "",
