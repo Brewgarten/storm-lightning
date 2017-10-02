@@ -1,4 +1,8 @@
 """
+Copyright (c) IBM 2015-2017. All Rights Reserved.
+Project name: storm-lightning
+This project is licensed under the MIT License, see LICENSE
+
 Storm lightning local ``libvirt``-based virtual machine tooling
 """
 from pkgutil import extend_path

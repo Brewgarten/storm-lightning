@@ -1,3 +1,8 @@
+"""
+Copyright (c) IBM 2015-2017. All Rights Reserved.
+Project name: storm-lightning
+This project is licensed under the MIT License, see LICENSE
+"""
 from __future__ import print_function
 
 import sys
@@ -26,7 +31,7 @@ setup(
         "prettytable",
     ],
     keywords = "python storm cloud",
-    license = "IBM",
+    license = "MIT",
     name = "storm-lightning",
     packages = find_packages(),
     setup_requires=[] + pytest_runner,
